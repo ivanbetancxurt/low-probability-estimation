@@ -24,13 +24,6 @@ RECOMMENDED_TEMPS = {
     }
 }
 
-def is_colab():
-    try:
-        import google.colab
-        return True
-    except ImportError:
-        return False
-
 def load_ground_truth(model_name: str, dist_names: list[str] = DISTRIB_NAMES, device: str = "cpu"):
     """
     Returns a dictionary of tensors of length `vocab_size` denoting the frequencies. The sum of each tensor is 2^32.
@@ -39,22 +32,9 @@ def load_ground_truth(model_name: str, dist_names: list[str] = DISTRIB_NAMES, de
     gt_freqs = {}
     
     for dist_name in dist_names:
-        file_path = f"gs://arc-ml-public/lpe/ground-truth/{model_name}/frequencies32-{dist_name}.pt"
-        
-        if is_colab():
-            # If in Colab, download the file using gsutil
-            local_file = f"frequencies32-{model_name}-{dist_name}.pt"
-            subprocess.run(['gsutil', 'cp', file_path, local_file], check=True)
-            
-            # Load the local file
-            gt_freqs[dist_name] = th.load(local_file, map_location=device, weights_only=True)
-            
-            # Clean up the local file
-            os.remove(local_file)
-        else:
-            # If not in Colab, use blobfile as normal
-            with bf.BlobFile(file_path, "rb") as f:
-                gt_freqs[dist_name] = th.load(f, map_location=device, weights_only=True)
+        with bf.BlobFile(f"gs://arc-ml-public/lpe/ground-truth/{model_name}/frequencies32-{dist_name}.pt"
+, "rb") as f:
+            gt_freqs[dist_name] = th.load(f, map_location=device, weights_only=True)
         
         assert th.sum(gt_freqs[dist_name]).item() == 2**32
     
