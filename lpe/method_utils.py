@@ -32,8 +32,7 @@ def load_ground_truth(model_name: str, dist_names: list[str] = DISTRIB_NAMES, de
     gt_freqs = {}
     
     for dist_name in dist_names:
-        with bf.BlobFile(f"gs://arc-ml-public/lpe/ground-truth/{model_name}/frequencies32-{dist_name}.pt"
-, "rb") as f:
+        with bf.BlobFile(f"gs://arc-ml-public/lpe/ground-truth/{model_name}/frequencies32-{dist_name}.pt", "rb") as f:
             gt_freqs[dist_name] = th.load(f, map_location=device, weights_only=True)
         
         assert th.sum(gt_freqs[dist_name]).item() == 2**32
