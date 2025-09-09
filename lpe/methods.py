@@ -259,39 +259,43 @@ def MHIS(
     Returns:
     - The estimated probability of outputing token `target`.
     """
-    d_vocab = model.embed.d_vocab
-    ctx_len = len(orig_dists)
-    scores = th.zeros((ctx_len, d_vocab), device=model.device)
+    d_vocab = model.embed.d_vocab #* vocabulary size
+    ctx_len = len(orig_dists) #* length of the input sequence (context length)
+    #scores = th.zeros((ctx_len, d_vocab), device=model.device) 
 
+    #* we're not training the model so freeze the parameters
     for param in model.parameters():
         param.requires_grad_(False)
 
     orig_log_probs = []
-    for pos in range(ctx_len):
-        mask = -th.inf * th.ones(d_vocab, device=model.device)
-        mask[orig_dists[pos].values] = th.log(orig_dists[pos].probs)
-        orig_log_probs.append(mask)
-    orig_log_probs = th.stack(orig_log_probs)
+    for pos in range(ctx_len): #* for every distribution position in the context...
+        mask = -th.inf * th.ones(d_vocab, device=model.device) #* make a vector of length vocabulary-size of -inf (disallowed tokens)
+        mask[orig_dists[pos].values] = th.log(orig_dists[pos].probs) #* at the positions of the allowed token, fill in that vector with that token's log prob
+        orig_log_probs.append(mask) #* add that vector to orig_log_probs list
+    orig_log_probs = th.stack(orig_log_probs) #* convert the orig_log_probs list into a (ctx_len, d_vocab) matrix
 
-    for param in model.parameters():
-        param.requires_grad_(False)
+    #for param in model.parameters():
+    #    param.requires_grad_(False)
 
     results = []
     scores = []
 
     with th.enable_grad():
         # Initialize the first batch of samples
-        current_samples = th.stack([dist.sample((batch_size,)) for dist in orig_dists], dim=1)
+        current_samples = th.stack([dist.sample((batch_size,)) for dist in orig_dists], dim=1) #* sample batch_size input sequences as a matrix of shape (batch_size, ctx_len), so each value is a token ID
 
         acceptance_rate = 0
         total_proposals = 0
 
         for step in tqdm(range((n_samples // batch_size + burn_in)), disable=not show_progress):
 
-            if step == 0:
-
+            if step == 0: #* on the first step...
+                
+                #* turn the input sequences matrix into 3D onehot tensor of shape (batch_size, ctx_len, d_vocab)
                 onehot = th.nn.functional.one_hot(current_samples, num_classes=d_vocab).float()
                 onehot.requires_grad_(True)
+
+                
                 x = onehot @ model.embed.W_E
                 x = x + model.pos_embed(current_samples)
                 for block in model.blocks:
