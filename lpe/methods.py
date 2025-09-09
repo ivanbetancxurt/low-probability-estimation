@@ -267,9 +267,13 @@ def MHIS(
     for param in model.parameters():
         param.requires_grad_(False)
 
+    ## compute the log probabilities of the original input distribution, which is our baseline p(x) 
+    ## the mask ensures that only valid tokens have a nonnegative probabiity, while setting invalid tokens to -inf 
     orig_log_probs = []
     for pos in range(ctx_len): #* for every distribution position in the context...
         mask = -th.inf * th.ones(d_vocab, device=model.device) #* make a vector of length vocabulary-size of -inf (disallowed tokens)
+        ## the valid tokens = orig_dists[pos].values
+        ## valid token probabilities = orig_dists[pos].probs. here, we take the log-prob
         mask[orig_dists[pos].values] = th.log(orig_dists[pos].probs) #* at the positions of the allowed token, fill in that vector with that token's log prob
         orig_log_probs.append(mask) #* add that vector to orig_log_probs list
     orig_log_probs = th.stack(orig_log_probs) #* convert the orig_log_probs list into a (ctx_len, d_vocab) matrix
@@ -292,17 +296,19 @@ def MHIS(
             if step == 0: #* on the first step...
                 
                 #* turn the input sequences matrix into 3D onehot tensor of shape (batch_size, ctx_len, d_vocab)
+                ## turning the input sequence into a one-hot encoding allows us to treat these input tokens as continuous, and hence take the gradient with respect to them
                 onehot = th.nn.functional.one_hot(current_samples, num_classes=d_vocab).float()
                 onehot.requires_grad_(True)
 
                 #* Perform forward pass through the model for the current samples
                 x = onehot @ model.embed.W_E                #* multiply one-hot encoded tokens by the embedding matrix to get token embeddings                  
-                x = x + model.pos_embed(current_samples)    #* add positional encoding to embeddings
+                x = x + model.pos_embed(current_samples)    #* add positional encoding to embeddings (pos_embed is definied in components.py within utils)
 
                 #* Then, pass token embeddings through transformer layers to capture context from the entire sequence.
                 for block in model.blocks:
                     x = block(x)                         #* Each block processes embeddings and captures the relationships between tokens.
                 x = model.ln_final(x[:,-1].unsqueeze(1)) #* apply final layer normalization to last token
+                ## the resulting x is indexed by [:, -1], and can be thought of as the contextual information of the last token position
                 
                 #* logits for each token (our raw predictions)
                 y = model.unembed(x).squeeze(1) #* convert embeddings back to raw logits for token predictions
@@ -569,3 +575,7 @@ def DA_MHIS(
     unbiased_estimates = results * normalizing_constant / exp_scores
 
     return unbiased_estimates.mean().item()
+
+def MTM_MHIS(
+        
+)
