@@ -295,40 +295,50 @@ def MHIS(
                 onehot = th.nn.functional.one_hot(current_samples, num_classes=d_vocab).float()
                 onehot.requires_grad_(True)
 
-                
-                x = onehot @ model.embed.W_E
-                x = x + model.pos_embed(current_samples)
+                #* Perform forward pass through the model for the current samples
+                x = onehot @ model.embed.W_E                #* multiply one-hot encoded tokens by the embedding matrix to get token embeddings                  
+                x = x + model.pos_embed(current_samples)    #* add positional encoding to embeddings
+
+                #* Then, pass token embeddings through transformer layers to capture context from the entire sequence.
                 for block in model.blocks:
-                    x = block(x)
-                x = model.ln_final(x[:,-1].unsqueeze(1))
-                y = model.unembed(x).squeeze(1)
-                current_scores = y[:, target]
-                current_scores.sum().backward()
-                current_scores = current_scores.detach().clone()
-                current_grads = onehot.grad.detach().clone()
+                    x = block(x)                         #* Each block processes embeddings and captures the relationships between tokens.
+                x = model.ln_final(x[:,-1].unsqueeze(1)) #* apply final layer normalization to last token
+                
+                #* logits for each token (our raw predictions)
+                y = model.unembed(x).squeeze(1) #* convert embeddings back to raw logits for token predictions
+                current_scores = y[:, target]   #* extract the logit that corresponds to the target token
+
+                #* Computes gradients of the target logit with respect to our input
+                current_scores.sum().backward()                     #* 1) perform backpropogation
+                current_scores = current_scores.detach().clone()    #* 2) Detatch gradients from the computation graph
+                current_grads = onehot.grad.detach().clone()        #* 3) store gradients so we cna use them later.
+
+                #* Checks if the model correctly predicted target token
                 current_results = (y.argmax(dim=-1) == target).float()
 
+            #* pick a random position to make a token proposal
             pos = th.randint(0, ctx_len, (batch_size,), device=current_samples.device)
             
             # Compute proposal probabilities
             proposal_logits = orig_log_probs[pos] + current_grads[th.arange(batch_size), pos] / temp
-            proposal_probs = th.softmax(proposal_logits, dim=-1)
+            proposal_probs = th.softmax(proposal_logits, dim=-1) #* Adding gradients to logits and converting to probabilities
             
-            # Propose new tokens
+            # Propose new tokens #* (sample new tokens from the proposal distribution)
             proposed_tokens = th.multinomial(proposal_probs, 1).squeeze(-1)
 
             # Create proposed samples
             proposed_samples = current_samples.clone()
-            proposed_samples[th.arange(batch_size), pos] = proposed_tokens
+            proposed_samples[th.arange(batch_size), pos] = proposed_tokens #* Replace selected positions with the new proposed tokens
 
-            # Recompute scores and gradients for proposed samples
+            # Recompute scores and gradients for proposed samples. No difference in the following section than in the first step
             onehot = th.nn.functional.one_hot(proposed_samples, num_classes=d_vocab).float()
-            onehot.requires_grad_(True)
-            x = onehot @ model.embed.W_E
-            x = x + model.pos_embed(proposed_samples)
+            onehot.requires_grad_(True)                 
+            x = onehot @ model.embed.W_E                
+            x = x + model.pos_embed(proposed_samples)  
+
             for block in model.blocks:
                 x = block(x)
-            x = model.ln_final(x[:,-1].unsqueeze(1))
+            x = model.ln_final(x[:,-1].unsqueeze(1)) 
             y = model.unembed(x).squeeze(1)
             proposed_scores = y[:, target]
             proposed_scores.sum().backward()
@@ -340,39 +350,45 @@ def MHIS(
 
             # Compute reverse proposal probabilities
             reverse_proposal_logits = orig_log_probs[pos] + proposed_grads[th.arange(batch_size), pos] / temp
-            reverse_proposal_probs = th.softmax(reverse_proposal_logits, dim=-1)
+            reverse_proposal_probs = th.softmax(reverse_proposal_logits, dim=-1) #* reverse proposal probabilities = adjusting logits w/ gradients
 
-            # Compute log acceptance probabilities
+            # Compute log acceptance probabilities using proposed and current scores, and proposal probabilities
             log_accept_probs = (proposed_scores - current_scores) / temp + \
                                orig_log_probs[pos, proposed_tokens] - orig_log_probs[pos, current_samples[th.arange(batch_size), pos]] + \
                                th.log(reverse_proposal_probs[th.arange(batch_size), current_samples[th.arange(batch_size), pos]]) - \
                                th.log(proposal_probs[th.arange(batch_size), proposed_tokens])
 
             # Accept or reject proposals
-            accept_mask = th.log(th.rand(batch_size, device=log_accept_probs.device)) < log_accept_probs
-            current_samples[accept_mask] = proposed_samples[accept_mask]
-            current_scores[accept_mask] = proposed_scores[accept_mask]
+            accept_mask = th.log(th.rand(batch_size, device=log_accept_probs.device)) < log_accept_probs #* Randomly accept/reject proposals based on log acceptance probabilities
+            current_samples[accept_mask] = proposed_samples[accept_mask] #* Accept proposed samples if acceptance test passed
+
+            #* Accept proposed scores, gradients, and results if proposal is accepted.
+            current_scores[accept_mask] = proposed_scores[accept_mask]                                   
             current_grads[accept_mask] = proposed_grads[accept_mask]
             current_results[accept_mask] = proposed_results[accept_mask]
 
+            #* Detach current values so we don't do furthur gradient tracking. i.e. detach & clone scores, gradients, results, and current samples.
             current_scores = current_scores.detach().clone()
             current_grads = current_grads.detach().clone()
             current_results = current_results.detach().clone()
             current_samples = current_samples.detach().clone()
-
+            
+            #* record results after "burn-in period", basically during the initial burn in period, the model is exploring the token space but we don't consider those samples to be reliable for statistics or estimations. 
+            #* We're discarding samples that could have been influenced by random initializaiton or transient states, and we're ensuring the Markov chain is stable. 
             if step >= burn_in:
                 results.append(current_results.detach().clone())
                 scores.append(current_scores.detach().clone())
-
+            
+            #* Keep tracking the acceptance rate and & of proposals
             acceptance_rate += accept_mask.float().mean().item()
             total_proposals += 1
 
     acceptance_rate /= total_proposals
 
-    results = th.cat(results)
-    scores = th.cat(scores)
-    exp_scores = th.exp(scores / temp)
-    normalizing_constant = 1 / (1 / exp_scores).mean().item()  # E_p[exp(s(x)/temp)]
-    unbiased_estimates = results * normalizing_constant / exp_scores
+    results = th.cat(results)       # list of results (stored in batches) concatenated into a single tensor
+    scores = th.cat(scores)         # list of scores ""
+    exp_scores = th.exp(scores / temp) # Exponentiate the scores to transform them into probabilities
+    normalizing_constant = 1 / (1 / exp_scores).mean().item()  # E_p[exp(s(x)/temp)] -> just the normalizing constant
+    unbiased_estimates = results * normalizing_constant / exp_scores    # use normalizing constant ti give us our final unbiased estimates.
 
     return unbiased_estimates.mean().item()
