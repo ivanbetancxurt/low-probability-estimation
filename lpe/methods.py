@@ -3,6 +3,7 @@ from fancy_einsum import einsum
 from tqdm import tqdm
 
 from .utils import Discrete
+from torch.distributions import Categorical
 
 
 def random_constraint_projection(
@@ -576,6 +577,151 @@ def DA_MHIS(
 
     return unbiased_estimates.mean().item()
 
-def MTM_MHIS(
-        
-)
+def MT_MHIS(
+        model,
+        orig_dists: list[Discrete],
+        target: int,
+        *,
+        temp: float,
+        n_samples: int,
+        burn_in: int,
+        batch_size: int = 32,
+        n_candidates: int = 4, # this will be the new proposed number of candidates per token position (where currently, n_candidates = 1)
+        show_progress: bool = False
+) -> float:
+    """
+    Multi-Try Metropolis-Hastings Importance Sampling (MT-MHIS).
+    Stationary: q(x) ∝ exp(s(x)/temp) * p(x), with MH proposal modified to propose n_candidates per step.
+    Proposal: Propose n_candidates tokens per position, and select one via a weighted sample.
+    Acceptance: Modify acceptance ratio to account for n_candidates proposals in forward and reverse directions.
+    """
+    d_vocab = model.embed.d_vocab
+    ctx_len = len(orig_dists)
+
+    # Freeze model params
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    # Calculate original log probabilities, blocking the invalid tokens with -inf (same as original MHIS)
+    orig_log_probs = []
+    for pos in range(ctx_len):
+        mask = -th.inf * th.ones(d_vocab, device=model.device)
+        mask[orig_dists[pos].values] = th.log(orig_dists[pos].probs)
+        orig_log_probs.append(mask)
+    orig_log_probs = th.stack(orig_log_probs)  # (ctx_len, d_vocab)
+
+    results = []
+    scores  = []
+
+    with th.enable_grad():
+        # initialize the first batch of samples 
+        current_samples = th.stack([dist.sample((batch_size,)) for dist in orig_dists], dim=1)  # (B, L)
+
+        acceptance_rate   = 0.0
+        total_proposals   = 0
+
+        # iterate over the total number of samples + burn-in period (same as original MHIS) 
+        for step in tqdm(range((n_samples // batch_size + burn_in)), disable=not show_progress):
+            if step == 0:
+                # forward/backward pass at current state (collect scores, grads, results)
+                onehot = th.nn.functional.one_hot(current_samples, num_classes=d_vocab).float()
+                onehot.requires_grad_(True)
+
+                x = onehot @ model.embed.W_E
+                x = x + model.pos_embed(current_samples)
+
+                for block in model.blocks:
+                    x = block(x)
+                x = model.ln_final(x[:, -1].unsqueeze(1))
+                y = model.unembed(x).squeeze(1)
+
+                # collecting scores, grads
+                current_scores = y[:, target]
+                current_scores.sum().backward()
+                current_scores = current_scores.detach().clone()
+                current_grads = onehot.grad.detach().clone()
+
+                # log results (i.e. whether desired target behavior was exhibited)
+                current_results = (y.argmax(dim=-1) == target).float()
+
+            # for each step, pick a random position to propose from (same as normal MHIS)
+            pos = th.randint(0, ctx_len, (batch_size,), device=current_samples.device)  
+
+            # then, instead of proposing just one candidate, we want to propose multiple candidates
+            # this means that we sample multiple tokens from th.multinomial
+            candidate_logits = orig_log_probs[pos] + current_grads[th.arange(batch_size), pos].unsqueeze(1) / temp  
+            candidate_probs = th.softmax(candidate_logits, dim=-1) 
+            candidate_tokens = th.multinomial(candidate_probs, n_candidates)
+
+            # then, we compute the proposal probabilities
+            proposal_logits = orig_log_probs[pos].unsqueeze(1) + current_grads[th.arange(batch_size), pos].unsqueeze(1) / temp
+            proposal_probs = th.softmax(proposal_logits, dim=-1)
+            proposal_probs = proposal_probs.gather(2, candidate_tokens)
+
+            # then, we select a token based on the proposal probabilities
+            selected_indices = Categorical(proposal_probs.view(batch_size * n_candidates)).sample()
+            selected_candidates = candidate_tokens.view(batch_size * n_candidates)[selected_indices]
+
+            # Create proposed samples
+            proposed_samples = current_samples.clone()
+            proposed_samples[th.arange(batch_size).repeat_interleave(n_candidates), pos] = selected_candidates
+
+            # Recompute scores and gradients for proposed samples
+            onehot = th.nn.functional.one_hot(proposed_samples, num_classes=d_vocab).float()
+            onehot.requires_grad_(True)
+
+            x = onehot @ model.embed.W_E
+            x = x + model.pos_embed(proposed_samples)
+
+            for block in model.blocks:
+                x = block(x)
+            x = model.ln_final(x[:, -1].unsqueeze(1))
+            y = model.unembed(x).squeeze(1)
+            proposed_scores = y[:, target]
+            proposed_scores.sum().backward()
+            proposed_grads = onehot.grad.clone()
+            proposed_results = (y.argmax(dim=-1) == target).float()
+
+            onehot.grad = None
+
+            # Compute reverse proposal probabilities
+            reverse_proposal_logits = orig_log_probs[pos].unsqueeze(1) + proposed_grads[th.arange(batch_size), pos].unsqueeze(1) / temp
+            reverse_proposal_probs = th.softmax(reverse_proposal_logits, dim=-1)
+            reverse_proposal_probs = reverse_proposal_probs.gather(2, candidate_tokens)
+
+            # Compute log acceptance probabilities
+            log_accept_probs = (proposed_scores - current_scores) / temp + \
+                               orig_log_probs[pos].unsqueeze(1).gather(2, candidate_tokens) - \
+                               orig_log_probs[pos].unsqueeze(1).gather(2, selected_candidates.unsqueeze(1)) + \
+                               th.log(reverse_proposal_probs.view(batch_size * n_candidates)) - \
+                               th.log(proposal_probs.view(batch_size * n_candidates))
+
+            accept_mask = th.log(th.rand(batch_size * n_candidates, device=log_accept_probs.device)) < log_accept_probs
+            accept_mask = accept_mask.view(batch_size, n_candidates).any(dim=1)
+
+            current_samples[accept_mask] = proposed_samples[accept_mask]
+            current_scores[accept_mask] = proposed_scores[accept_mask]
+            current_grads[accept_mask] = proposed_grads[accept_mask]
+            current_results[accept_mask] = proposed_results[accept_mask]
+
+            current_scores = current_scores.detach().clone()
+            current_grads = current_grads.detach().clone()
+            current_results = current_results.detach().clone()
+            current_samples = current_samples.detach().clone()
+
+            if step >= burn_in:
+                results.append(current_results.detach().clone())
+                scores.append(current_scores.detach().clone())
+
+            acceptance_rate += accept_mask.float().mean().item()
+            total_proposals += 1
+
+    acceptance_rate /= total_proposals
+
+    results = th.cat(results)
+    scores = th.cat(scores)
+    exp_scores = th.exp(scores / temp)
+    normalizing_constant = 1 / (1 / exp_scores).mean().item()
+    unbiased_estimates = results * normalizing_constant / exp_scores
+
+    return unbiased_estimates.mean().item()
