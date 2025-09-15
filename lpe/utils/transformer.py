@@ -266,7 +266,8 @@ class Transformer(th.nn.Module):
     # basically, this function maps hidden states (aka the token IDs) back into the vocabulary space
     # the output is a distribution over "what the next token should be" for each sequence and position 
 
-    
+    # this takes in tokens to predict the next one 
+    # completion_length is how many tokens to predict
     def sample(
         self,
         tokens: Int[th.Tensor, "batch pos"],
@@ -274,14 +275,22 @@ class Transformer(th.nn.Module):
         *,
         temperature: float = 1.0,
     ):
+        # first, we're looking for the location / ID of where the padding begins (or where the real token itself ends) 
         pad_token_id = self.tokenizer.pad_token_id
         last_non_pad_index = (tokens != pad_token_id).long().cumsum(1).max(1).indices
         pad_token = th.tensor(
             [[pad_token_id]] * tokens.shape[0], dtype=tokens.dtype, device=tokens.device
         )
+
+        # initialize completion tensor to be empty, but with the same batch size as tokens
+        # to generate one completion for each sequence in the batch size 
         completion = th.zeros(
             tokens.shape[0], 0, dtype=tokens.dtype, device=tokens.device
         )
+
+        # for each token in the sequence, generate logits (but only from the last non-pad position, aka the most recent token)
+        # then, if temperature is 0, use greedy decoding (argmax, taking the most likely next token)
+        # otherwise, use temperature to scale the logits and sample from the distribution 
         for _ in range(completion_length):
             logits = self.logits(tokens)[th.arange(tokens.shape[0]), last_non_pad_index]
             if temperature == 0.0:
@@ -295,6 +304,9 @@ class Transformer(th.nn.Module):
             tokens[th.arange(tokens.shape[0]), last_non_pad_index] = next_token
         return completion
 
+    # this function gives the probability distribution over the vocab at each step of the sequence 
+    # this does so by calculating the logits over the entire sequence of tokens
+    # then, it applies softmax over the logits to convert them to probabilities 
     def probs(
         self,
         tokens: Int[th.Tensor, "batch pos"],
