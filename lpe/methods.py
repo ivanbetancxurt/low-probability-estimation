@@ -297,7 +297,7 @@ def MHIS(
     """
     d_vocab = model.embed.d_vocab #* vocabulary size
     ctx_len = len(orig_dists) #* length of the input sequence (context length)
-    #scores = th.zeros((ctx_len, d_vocab), device=model.device) 
+    scores = th.zeros((ctx_len, d_vocab), device=model.device) 
 
     #* we're not training the model so freeze the parameters
     for param in model.parameters():
@@ -643,7 +643,7 @@ def MT_MHIS(
         mask = -th.inf * th.ones(d_vocab, device=model.device)
         mask[orig_dists[pos].values] = th.log(orig_dists[pos].probs)
         orig_log_probs.append(mask)
-    orig_log_probs = th.stack(orig_log_probs)  # (ctx_len, d_vocab)
+    orig_log_probs = th.stack(orig_log_probs)  # After stacking, resulting shape is (ctx_len, d_vocab)
 
     results = []
     scores  = []
@@ -684,22 +684,27 @@ def MT_MHIS(
 
             # then, instead of proposing just one candidate, we want to propose multiple candidates
             # this means that we sample multiple tokens from th.multinomial
+            # candidate_logits has shape (batch_size, d_vocab), and so does candidate_probs
             candidate_logits = orig_log_probs[pos] + current_grads[th.arange(batch_size), pos].unsqueeze(1) / temp  
             candidate_probs = th.softmax(candidate_logits, dim=-1) 
-            candidate_tokens = th.multinomial(candidate_probs, n_candidates)
+            # this has shape (batch_size, n_candidates) 
+            candidate_tokens = th.multinomial(candidate_probs, n_candidates, replacement=True)
 
-            # then, we compute the proposal probabilities
-            proposal_logits = orig_log_probs[pos].unsqueeze(1) + current_grads[th.arange(batch_size), pos].unsqueeze(1) / temp
-            proposal_probs = th.softmax(proposal_logits, dim=-1)
-            proposal_probs = proposal_probs.gather(2, candidate_tokens)
+            # we want to sample multiple candidates per batch element
+            # candidate_probs has shape (batch_size, d_vocab), candidate_tokens has shape (batch_size, n_candidates)
+            # hence, we can gather along dim=1 to only get the probabilities of the sampled candidates
+            # candidate_token_probs has shape (batch_size, n_candidates)
+            candidate_token_probs = candidate_probs.gather(1, candidate_tokens)
 
             # then, we select a token based on the proposal probabilities
-            selected_indices = Categorical(proposal_probs.view(batch_size * n_candidates)).sample()
-            selected_candidates = candidate_tokens.view(batch_size * n_candidates)[selected_indices]
+            # first, we have to normalize the proposal probabilities and pick one candidate per batch to move forward with
+            weights = candidate_token_probs / candidate_token_probs.sum(dim=1, keepdim=True)  # (batch_size, n_candidates)
+            selected_indices = Categorical(weights).sample() # (batch_size,)
+            selected_candidates = candidate_tokens[th.arange(batch_size), selected_indices]   # (batch_size,)
 
             # Create proposed samples
             proposed_samples = current_samples.clone()
-            proposed_samples[th.arange(batch_size).repeat_interleave(n_candidates), pos] = selected_candidates
+            proposed_samples[th.arange(batch_size), pos] = selected_candidates
 
             # Recompute scores and gradients for proposed samples
             onehot = th.nn.functional.one_hot(proposed_samples, num_classes=d_vocab).float()
@@ -720,16 +725,18 @@ def MT_MHIS(
             onehot.grad = None
 
             # Compute reverse proposal probabilities
-            reverse_proposal_logits = orig_log_probs[pos].unsqueeze(1) + proposed_grads[th.arange(batch_size), pos].unsqueeze(1) / temp
-            reverse_proposal_probs = th.softmax(reverse_proposal_logits, dim=-1)
-            reverse_proposal_probs = reverse_proposal_probs.gather(2, candidate_tokens)
+            reverse_candidate_tokens = candidate_tokens.unsqueeze(1) # (batch_size, 1, n_candidates)
+            reverse_proposal_probs = reverse_proposal_probs.gather(2, reverse_candidate_tokens) # (batch_size, 1, n_candidates)
+            reverse_proposal_probs = reverse_proposal_probs.squeeze(1) # (batch_size, n_candidates)
 
             # Compute log acceptance probabilities
+            # We only want to use the selected candidate per batch 
+            selected_candidate_probs = candidate_token_probs[th.arange(batch_size), selected_indices] # (batch_size,)
+            reverse_selected_probs = reverse_proposal_probs[th.arange(batch_size), selected_indices] # (batch_size,)
+
             log_accept_probs = (proposed_scores - current_scores) / temp + \
-                               orig_log_probs[pos].unsqueeze(1).gather(2, candidate_tokens) - \
-                               orig_log_probs[pos].unsqueeze(1).gather(2, selected_candidates.unsqueeze(1)) + \
-                               th.log(reverse_proposal_probs.view(batch_size * n_candidates)) - \
-                               th.log(proposal_probs.view(batch_size * n_candidates))
+                               th.log(reverse_selected_probs) - \
+                               th.log(selected_candidate_probs) # resulting log_accept_probs shd be of shape (batch_size,)
 
             accept_mask = th.log(th.rand(batch_size * n_candidates, device=log_accept_probs.device)) < log_accept_probs
             accept_mask = accept_mask.view(batch_size, n_candidates).any(dim=1)
