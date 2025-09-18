@@ -916,3 +916,52 @@ def MT_MHIS_2(
     unbiased_estimates = results * normalizing_constant / exp_scores
 
     return unbiased_estimates.mean().item()
+
+def MO_MHIS(
+        model,
+        orig_dists: list[Discrete],
+        target: int,
+        *,
+        temp: float,
+        n_samples: int,
+        burn_in: int,
+        batch_size: int = 32,
+        lam: float = 0.5,
+        window_size: int = 2, 
+        show_progress: bool = False
+
+) -> float:
+    """
+    Momentum-based MHIS includes a pseudo-momentum-like smoothing term for the score function. This term smooths across token positions.
+    The smoothing coefficient, lam, can be specified (between range [0, 1]), as well as the window size, which takes a local average across nearby tokens.
+    """
+
+    # the first part, aka calculating the log probabilities of input dist p(x) is the same as original MHIS
+    d_vocab = model.embed.d_vocab 
+    ctx_len = len(orig_dists) 
+    scores = th.zeros((ctx_len, d_vocab), device=model.device) 
+
+    #* we're not training the model so freeze the parameters
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    orig_log_probs = []
+    for pos in range(ctx_len): 
+        mask = -th.inf * th.ones(d_vocab, device=model.device) 
+        mask[orig_dists[pos].values] = th.log(orig_dists[pos].probs) 
+        orig_log_probs.append(mask) 
+    orig_log_probs = th.stack(orig_log_probs)
+
+    results = []
+    scores = []
+
+    with th.enable_grad():
+        current_samples = th.stack([dist.sample((batch_size,)) for dist in orig_dists], dim=1) 
+
+        acceptance_rate = 0
+        total_proposals = 0
+
+        # here, we can start by initializing the scores after momentum term
+        ema_scores = th.zeros((batch_size, ctx_len), device = model.device)
+
+        for step in tqdm(range((n_samples // batch_size + burn_in)), disable=not show_progress):
