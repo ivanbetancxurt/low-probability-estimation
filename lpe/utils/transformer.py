@@ -20,6 +20,10 @@ from .components import (
 )
 from .discrete import Discrete
 
+# overall, this file implements a small transformer architecture so that we can test on toy models
+
+# maps shortcut names to Hugging Face repos (aka Neel Nanda's interpretability toy models)
+# also, get a tokenizer below from Neel Nanda
 MODEL_REPO_NAMES = {
     "attn-only-1l": "NeelNanda/Attn_Only_1L512W_C4_Code",
     "attn-only-2l": "NeelNanda/Attn_Only_2L512W_C4_Code",
@@ -33,13 +37,18 @@ MODEL_REPO_NAMES = {
 
 TOKENIZER_REPO_NAME = "NeelNanda/gpt-neox-tokenizer-digits"
 
-
+# takes in a config dictionary, cfg, which contains parameters such as model size, depth 
 class Transformer(th.nn.Module):
     def __init__(self, cfg: dict, device=None, dtype=None):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.cfg = cfg
 
+        # here, we get the hyperparameters: normalization, attention type, positional embedding type
+        # limits these hyperparams to specific values
+        # normalization can only be layer norm (LM), others not implemented
+        # attention is always scaled dot-product, not local attention or bidirectional 
+        # positional embeddings can only be standard
         norm = cfg.get("normalization", cfg.get("normalization_type", "LN"))
         assert norm == "LN", f"{norm} normalization not yet implemented"
         assert cfg.get("use_attn_scale", True), "attention is always scaled"
@@ -55,17 +64,28 @@ class Transformer(th.nn.Module):
             pos_embed == "standard"
         ), "non-standard positional embeddings not implemented"
 
+        # the core components are defined by self.component below, imported from components.py file
+        # for the embedding vector, we specify the vocab size and model dimension, which are keys in the cfg dictionary
+        # the length of each embedding vector is d_model
+        # the entire embedding matrix has shape (d_vocab, d_model)
         self.embed = Embed(
             d_vocab=cfg["d_vocab"], d_model=cfg["d_model"], **factory_kwargs
         )
+        # for the positional embedding, we specify the context length and model dimension
         self.pos_embed = PosEmbed(
             n_ctx=cfg["n_ctx"], d_model=cfg["d_model"], **factory_kwargs
         )
+        # some models are attention-only (no MLP layers)
+        # if not attention only, specify the MLP dimension and activation function as in config
         if not cfg.get("attn_only", False):
             mlp_cfg = {"d_mlp": cfg["d_mlp"], "act_fn": cfg["act_fn"]}
         else:
             mlp_cfg = {}
 
+        # define transformer block with attention hyperparameters and MLP (if applicable)
+        # specify attention heads, model dimension, dimension per head (attn params)
+        # ln_eps is a small epsilon to stabilize the normalization
+        # create n_layers transformer blocks 
         self.blocks = th.nn.ModuleList(
             [
                 TransformerBlock(
@@ -81,16 +101,24 @@ class Transformer(th.nn.Module):
                 for _ in range(cfg["n_layers"])
             ]
         )
+        # final layer normalization after transformer blocks
         self.ln_final = LayerNorm(
             d_model=cfg["d_model"], ln_eps=cfg["ln_eps"], **factory_kwargs
         )
+        # unembedding layer projects hidden states to vocab logits
         self.unembed = Unembed(
             d_model=cfg["d_model"], d_vocab=cfg["d_vocab"], **factory_kwargs
         )
+        # converts vocab logits back to probabilities 
         self.final_softmax = FinalSoftmax(
             d_model=cfg["d_model"], d_vocab=cfg["d_vocab"]
         )
-
+    
+    # W_E is the embedding matrix, which is a torch.nn.Parameter 
+    # these are shortcuts to access access its device and its dtype 
+    # now, instead of using model.embed.W_E.device, we can use model.device, and same for dtype 
+    # oftentimes, we want to move tensors to the same device as the model parameters, OR we want to convert tensors to the same dtype as the params
+    # hence, when we have this shortcut, we can easily access the device and dtype of the model params
     @property
     def device(self):
         return self.embed.W_E.device
@@ -99,25 +127,39 @@ class Transformer(th.nn.Module):
     def dtype(self):
         return self.embed.W_E.dtype
 
+    # context manager: this helps to move the model to a different device or dtype temporarily
+    # then, model is moved back to original device and dtype
+    # this is helpful if we want to run inference on lower-precision dtype for speed, or test CPU vs GPU
     @contextmanager
     def to_temp(self, dtype=None, device=None):
         orig_dtype = self.dtype
         orig_device = self.device
+        # check if the original dtype is a float (w deci), and the new target dtype is not
+        # or if the new dtype has lower precision (higher resolution value), then warn user that they're losing precision
         if orig_dtype.is_floating_point and dtype is not None:
             if (not dtype.is_floating_point) or (
                 th.finfo(dtype).resolution > th.finfo(orig_dtype).resolution
             ):
                 warnings.warn("Converting to lower-precision dtype")
+        # try to convert the model to the new dtype and device
+        # then wait (yield) -- the user will perform calculations w new device/dtype in w "with" block
+        # then, the model will be converted back to the original dtype and device 
         try:
             self.to(dtype=dtype, device=device)
             yield
         finally:
             self.to(dtype=orig_dtype, device=orig_device)
 
+    # this function creates an empty Transformer model from a config file (with no weights)
+    # this is useful if we want to load custom weights instead of pretrained 
     @classmethod
     def create_empty(cls, model_name_or_path: str):
+        # if model_name_or_path is a Google Storage path, then find a config.json file in that path
         if model_name_or_path.startswith("gs://"):
             cfg_path = bf.join(bf.dirname(model_name_or_path), "config.json")
+
+        # otherwise, if it's a named model, then look up the HF repo name from the model names dict
+        # then, find the config.json path in the repo by downloading it thru HF 
         else:
             repo_name = MODEL_REPO_NAMES[model_name_or_path]
             cfg_path = hf_hub_download(repo_name, "config.json")
@@ -126,6 +168,8 @@ class Transformer(th.nn.Module):
             cfg = json.load(cfg_fh)
         model = cls(cfg)
 
+        # load tokenizer, and ensure that it doesn't prepend or append anything to the input
+        # to do this, we can use a sanity check to ensure that tokenizing an empty string returns an empty list
         model.tokenizer = AutoTokenizer.from_pretrained(cfg["tokenizer_name"])
         assert (
             len(model.tokenizer.encode("")) == 0
@@ -133,6 +177,9 @@ class Transformer(th.nn.Module):
 
         return model
 
+    # this method builds off of the create_empty method to load a pretrained model 
+    # similar to create_empty, fetch config file from GS path or HF repo 
+    # then, with blobfile, we can load the state dict (weights) from a specific checkpoint
     @classmethod
     def from_pretrained(
         cls,
@@ -159,6 +206,9 @@ class Transformer(th.nn.Module):
 
         return model
 
+    # initializes all weights in the model (embedding, positional embedding, attention, etc)
+    # initializes all the weights startihg w W
+    # each weight matrix is initialized as a normal distribution (th.nn.init.normal) with std proportional to (1/sqrt(inv_var))
     def init_weights(self, scale_mult: float = 1.0, seed: Optional[int] = None):
         if seed is None:
             generator = None
@@ -183,23 +233,41 @@ class Transformer(th.nn.Module):
                 scale = scale_mult * inv_var ** (-0.5)
                 th.nn.init.normal_(param, std=scale, generator=generator)
 
+    # this function converts a list of strings into a PyTorch tensor of token IDs 
+    # additionally, this also pads all the tokenized strings to the same length
+    # this is important because we want a rectangular batch tensor (with shape (batch_size, maxlen)) as an input to the model 
     def encode(self, strings: List[str]) -> Int[th.Tensor, "batch pos"]:
+        # first, tokenize each string with the HF tokenizer
         tokens = [self.tokenizer.encode(string) for string in strings]
         maxlen = max(len(t) for t in tokens)
+        # this line pads each string until the max length 
         tokens = [t + [self.tokenizer.pad_token_id] * (maxlen - len(t)) for t in tokens]
         return th.tensor(tokens, device=self.device)
 
+    # this function takes in a matrix of token IDs, which has shape (batch_size, pos)
+    # batch_size is the number of strings in the batch, and each row is one sequence
+    # each entry of tokens is an integer representing a token ID 
     def logits(
         self,
         tokens: Int[th.Tensor, "batch pos"],
     ) -> Float[th.Tensor, "batch pos d_vocab"]:
+        
+        # converting token IDs into embedding vectors, then adding on the positional embedding
+        # the embedding dimension is d_model as specifed earlier, so the resulting shape is (batch, pos, d_model)
         x = self.embed(tokens)
         x = x + self.pos_embed(tokens)
+
+        # then, pass this through each transformer block, and normalize it at the end
+        # resulting shape is still (batch, pos, d_model)
         for block in self.blocks:
             x = block(x)
         x = self.ln_final(x)
         return self.unembed(x)
+    # basically, this function maps hidden states (aka the token IDs) back into the vocabulary space
+    # the output is a distribution over "what the next token should be" for each sequence and position 
 
+    # this takes in tokens to predict the next one 
+    # completion_length is how many tokens to predict
     def sample(
         self,
         tokens: Int[th.Tensor, "batch pos"],
@@ -207,14 +275,22 @@ class Transformer(th.nn.Module):
         *,
         temperature: float = 1.0,
     ):
+        # first, we're looking for the location / ID of where the padding begins (or where the real token itself ends) 
         pad_token_id = self.tokenizer.pad_token_id
         last_non_pad_index = (tokens != pad_token_id).long().cumsum(1).max(1).indices
         pad_token = th.tensor(
             [[pad_token_id]] * tokens.shape[0], dtype=tokens.dtype, device=tokens.device
         )
+
+        # initialize completion tensor to be empty, but with the same batch size as tokens
+        # to generate one completion for each sequence in the batch size 
         completion = th.zeros(
             tokens.shape[0], 0, dtype=tokens.dtype, device=tokens.device
         )
+
+        # for each token in the sequence, generate logits (but only from the last non-pad position, aka the most recent token)
+        # then, if temperature is 0, use greedy decoding (argmax, taking the most likely next token)
+        # otherwise, use temperature to scale the logits and sample from the distribution 
         for _ in range(completion_length):
             logits = self.logits(tokens)[th.arange(tokens.shape[0]), last_non_pad_index]
             if temperature == 0.0:
@@ -228,6 +304,9 @@ class Transformer(th.nn.Module):
             tokens[th.arange(tokens.shape[0]), last_non_pad_index] = next_token
         return completion
 
+    # this function gives the probability distribution over the vocab at each step of the sequence 
+    # this does so by calculating the logits over the entire sequence of tokens
+    # then, it applies softmax over the logits to convert them to probabilities 
     def probs(
         self,
         tokens: Int[th.Tensor, "batch pos"],
