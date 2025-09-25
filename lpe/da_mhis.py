@@ -21,7 +21,6 @@ def DA_MHIS(
     Stage-1: cheap surrogate screen using Δ~M (linearized via current grads).
     Stage-2: exact correction using full forward at x' and reverse proposal at x'.
     """
-    import torch as th
     d_vocab = model.embed.d_vocab
     ctx_len = len(orig_dists)
 

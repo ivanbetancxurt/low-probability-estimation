@@ -1,3 +1,5 @@
+import torch as th
+
 class ModelAdapter:
     def __init__(self, hf_model, tokenizer, device=None):
         self.hf = hf_model.eval()
