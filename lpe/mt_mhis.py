@@ -1,3 +1,9 @@
+import torch as th
+from fancy_einsum import einsum
+from tqdm import tqdm
+
+from .utils import Discrete
+
 def MT_MHIS(
         model,
         orig_dists: list[Discrete],
