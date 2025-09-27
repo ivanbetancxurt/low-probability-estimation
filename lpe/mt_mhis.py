@@ -107,9 +107,15 @@ def MT_MHIS(
             # ----- Reverse multi-candidate proposal at x' (same candidates) -----
             rev_grad_term  = proposed_grads[th.arange(batch_size), pos] / temp           # (B, V)
             rev_logits     = orig_log_probs[pos] + rev_grad_term                         # (B, V)
-            rev_probs      = th.softmax(rev_logits, dim=-1)                              # (B, V)
-            reverse_candidate_probs = rev_probs.gather(1, candidate_tokens)              # (B, n_candidates)
-            reverse_selected_probs  = reverse_candidate_probs[th.arange(batch_size), selected_indices]  # (B,)
+            rev_probs      = th.softmax(rev_logits, dim=-1)      
+            
+            # Build reverse candidate set by injecting old token
+            reverse_candidates = candidate_tokens.clone()
+            reverse_candidates[:, 0] = current_samples[th.arange(batch_size), pos]
+
+            # Use reverse set to calculate reverse proposal probabilities
+            reverse_candidate_probs = rev_probs.gather(1, reverse_candidates)
+            reverse_selected_probs  = reverse_candidate_probs[th.arange(batch_size), selected_indices]
 
             # Prior ratio for selected candidate
             log_prior_ratio = orig_log_probs[pos, selected_candidates] - \
