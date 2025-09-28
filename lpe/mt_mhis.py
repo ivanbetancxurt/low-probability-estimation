@@ -1,8 +1,10 @@
 import torch as th
 from fancy_einsum import einsum
 from tqdm import tqdm
+from torch.distributions import Categorical
 
 from .utils import Discrete
+
 
 def MT_MHIS(
         model,
