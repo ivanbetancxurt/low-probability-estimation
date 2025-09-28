@@ -57,7 +57,7 @@ def MO_MHIS(
         for step in tqdm(range((n_samples // batch_size + burn_in)), disable=not show_progress):
 
             # same as normal MHIS - go through forward pass and then compute gradients
-            onehot = th.nn.functional.one_hot(current_samples,)
+            onehot = th.nn.functional.one_hot(current_samples, num_classes=d_vocab).float()
             onehot.requires_grad_(True)
 
             x = onehot @ model.embed.W_E
