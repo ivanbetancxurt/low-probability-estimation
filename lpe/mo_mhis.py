@@ -190,7 +190,7 @@ def MO_MHIS(
     exp_scores_seq = th.exp(scores.mean(dim=1) / temp)  # shape: [n_samples] 
 
     normalizing_constant = 1 / (1 / exp_scores_seq).mean().item()
-    unbiased_estimates = results.mean(dim=1) * normalizing_constant / exp_scores_seq # shape: [n_samples]
+    unbiased_estimates = results * normalizing_constant / exp_scores_seq # shape: [n_samples]
 
     return unbiased_estimates.mean().item()
 
