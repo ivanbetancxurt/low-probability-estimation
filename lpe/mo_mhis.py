@@ -72,6 +72,7 @@ def MO_MHIS(
             current_scores = y[:, target]
             current_scores.sum().backward()
             current_grads = onehot.grad.detach().clone() # this has same shape as the onehot vector, which is [batch_size, ctx_len, d_vocab]
+            current_results = (y.argmax(dim=-1) == target).float()
 
             # then, implement smoothing across token positions
             # 1) first, we wanwt to use a function that has a per-position scalar influence (i.e. some function that varies by position) 
@@ -96,7 +97,8 @@ def MO_MHIS(
             current_smoothed_at_pos = smoothed_scores[th.arange(batch_size), pos] # dim = [batch_size, ]
 
             # compute proposal probabilities using smoothed scores
-            proposal_logits = orig_log_probs[pos] + current_grads[th.arange(batch_size), pos] / temp
+            # for the proposal logits, we want to use the smoothed score at the position, instead of the original score
+            proposal_logits = orig_log_probs[pos] + current_smoothed_at_pos.unsqueeze(-1) / temp
             proposal_probs = th.softmax(proposal_logits, dim=-1)
             proposed_tokens = th.multinomial(proposal_probs, 1).squeeze(-1)
 
@@ -104,6 +106,8 @@ def MO_MHIS(
             proposed_samples[th.arange(batch_size), pos] = proposed_tokens
 
             # recompute scores and grads for proposed samples
+            # this is the true model score for the proposed samples, which we will use in the acceptance probability 
+            # in the acceptance probability, this can be thought of as pi(x)
             onehot = th.nn.functional.one_hot(proposed_samples, num_classes=d_vocab).float()
             onehot.requires_grad_(True)
             x = onehot @ model.embed.W_E
@@ -112,6 +116,8 @@ def MO_MHIS(
                 x = block(x)
             x = model.ln_final(x[:, -1].unsqueeze(1))
             y = model.unembed(x).squeeze(1)
+
+            # proposed scores is the model's score for the target token for each batch
             proposed_scores = y[:, target]
             proposed_scores.sum().backward()
             proposed_grads = onehot.grad.clone()
@@ -120,53 +126,54 @@ def MO_MHIS(
             proposed_results = (y.argmax(dim=-1) == target).float()
 
 
-            # then, we want to include the proposed smoothed
+            # here, we build the reverse proposal distribution q(x_current | x_proposed)
+            # at the proposed states (x_current), we need to use the smoothed scores 
             pad_proposed_g = th.nn.functional.pad(proposed_g, (window_size, window_size), mode='replicate')
             avg_neighbors_prop = th.stack([pad_proposed_g[:, i:i+2*window_size+1].mean(dim=1) for i in range(ctx_len)], dim=1)
             proposed_smoothed = (1 - lam) * proposed_g + lam * avg_neighbors_prop
             proposed_smoothed_at_pos = proposed_smoothed[th.arange(batch_size), pos]  # [B,]
 
             # calculate reverse proposal logits
-            reverse_proposal_logits = orig_log_probs[pos] + proposed_grads[th.arange(batch_size), pos] / temp
+            reverse_proposal_logits = orig_log_probs[pos] + proposed_smoothed_at_pos.unsqueeze(-1) / temp
             reverse_proposal_probs = th.softmax(reverse_proposal_logits, dim=-1)
 
-            # in the acceptance probability, instead of using smoothed_scores, we use smoothed_scalar_at_pos
-            # basically, the acceptance probability samples from a "surrogate" distribution, as we have replaced the score with the smoothed score
-            # hence, we don't want to use the original proposed_scores anymore 
-            log_accept_probs = (proposed_smoothed_at_pos - current_smoothed_at_pos) / temp + \
-                               orig_log_probs[pos, proposed_tokens] - orig_log_probs[pos, current_samples[th.arange(batch_size), pos]] + \
-                               th.log(reverse_proposal_probs[th.arange(batch_size), current_samples[th.arange(batch_size), pos]]) - \
-                               th.log(proposal_probs[th.arange(batch_size), proposed_tokens])
+            # calculating the acceptance probability
+            log_pi_current = current_scores + orig_log_probs[pos, current_samples[th.arange(batch_size), pos]]
+            log_pi_proposed = proposed_scores + orig_log_probs[pos, proposed_tokens]    
+
+            log_accept_probs = (log_pi_proposed - log_pi_current) 
+            + (reverse_proposal_probs[th.arange(batch_size), current_samples[th.arange(batch_size), pos]].log() 
+               - proposal_probs[th.arange(batch_size), proposed_tokens].log())
+
 
             accept_mask = th.log(th.rand(batch_size, device=log_accept_probs.device)) < log_accept_probs
             
             # safe indexing to update per-position arrays: get accepted row indices
             accepted_idx = accept_mask.nonzero(as_tuple=True)[0]   # 1D tensor of accepted batch indices
 
-            if accepted_idx.numel() > 0:
-                # update sequences
-                current_samples[accepted_idx] = proposed_samples[accepted_idx]
-                # update scalar results & grads & per-position g + ema (only at the accepted (b, pos[b]) entries)
-                current_results[accepted_idx] = proposed_results[accepted_idx]
-                current_grads[accepted_idx] = proposed_grads[accepted_idx]
+            if accept_mask.any():
+                rows = accept_mask.nonzero(as_tuple=True)[0]
+                cols = pos[rows]
 
-                # update ema_scores at the accepted positions explicitly
-                rows = accepted_idx
-                cols = pos[accepted_idx]
-                ema_scores[rows, cols] = proposed_g[rows, cols]
+                # Update token sequences
+                current_samples[rows, cols] = proposed_samples[rows, cols]
 
-                # also update any scalar sequence-level score if you keep one
-                current_scores[accepted_idx] = proposed_scores[accepted_idx]
+                # Update scalar sequence-level results and scores
+                current_results[rows] = proposed_results[rows]
+                current_scores[rows] = proposed_scores[rows]
 
-            # also, want to update proposed_g at the desired positions
-            current_grads[accept_mask] = proposed_grads[accept_mask]
-            current_results[accept_mask] = proposed_results[accept_mask]
+                # Update per-position gradients
+                current_grads[rows] = proposed_grads[rows]
 
-            # detach & clone
-            smoothed_scores = smoothed_scores.detach().clone()
+                # Update EMA recursively for accepted positions
+                ema_scores[rows, cols] = (1 - lam) * ema_scores[rows, cols] + lam * proposed_g[rows, cols]
+
+            # Detach to break graph
+            current_samples = current_samples.detach().clone()
             current_grads = current_grads.detach().clone()
             current_results = current_results.detach().clone()
-            current_samples = current_samples.detach().clone()
+            ema_scores = ema_scores.detach().clone()
+
 
             if step >= burn_in:
                 results.append(current_results.detach().clone())
