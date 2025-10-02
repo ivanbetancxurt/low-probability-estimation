@@ -186,9 +186,11 @@ def MO_MHIS(
 
     results = th.cat(results)
     scores = th.cat(scores)
-    exp_scores = th.exp(scores / temp)
-    normalizing_constant = 1 / (1 / exp_scores).mean().item()
-    unbiased_estimates = results * normalizing_constant / exp_scores
+    # we want to compute sequence-levell estimates, so we average over the token positions
+    exp_scores_seq = th.exp(scores.mean(dim=1) / temp)  # shape: [n_samples] 
+
+    normalizing_constant = 1 / (1 / exp_scores_seq).mean().item()
+    unbiased_estimates = results.mean(dim=1) * normalizing_constant / exp_scores_seq # shape: [n_samples]
 
     return unbiased_estimates.mean().item()
 
