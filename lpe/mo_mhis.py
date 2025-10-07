@@ -379,3 +379,167 @@ def MO_MHIS_test2(
     unbiased_estimates = results * normalizing_constant / exp_scores
 
     return unbiased_estimates.mean().item()
+
+def MO_MHIS_v3(
+    model,
+    orig_dists: list[Discrete],
+    target: int,
+    *,
+    temp: float,
+    n_samples: int,
+    burn_in: int,
+    batch_size: int = 32,
+    lam: float = 0.95, # momentum parameter
+    show_progress: bool = False
+) -> float:
+    """
+    Metropolis-Hastings Importance Sampling, inspired by momentum method for optimizing GCG (MAC method).
+    Here, we want to add a velocity/momentum term based on the "gradient" signals that are computed for existing proposals (the g term is the current proposal estimate direction)
+    We keep the actual MHIS estimator unchanged, using the same importance weights from the original distribution to maintain unbiased estimates
+    """
+    d_vocab = model.embed.d_vocab
+    ctx_len = len(orig_dists)
+    scores = th.zeros((ctx_len, d_vocab), device=model.device)
+
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    orig_log_probs = []
+    for pos in range(ctx_len):
+        mask = -th.inf * th.ones(d_vocab, device=model.device)
+        mask[orig_dists[pos].values] = th.log(orig_dists[pos].probs)
+        orig_log_probs.append(mask)
+    orig_log_probs = th.stack(orig_log_probs)
+
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    results = []
+    scores = []
+
+    with th.enable_grad():
+        # Initialize the first batch of samples
+        current_samples = th.stack([dist.sample((batch_size,)) for dist in orig_dists], dim=1)
+
+        # We also add a per-chain, per-position velocity over vocab logits for next-token pred
+        # this would have shape (batch_size, ctx_len, d_vocab)
+        # initialize this to 0 vector like scores
+        velocity = th.zeros((batch_size, ctx_len, d_vocab), device=model.device)
+
+        acceptance_rate = 0
+        total_proposals = 0
+
+        for step in tqdm(range((n_samples // batch_size + burn_in)), disable=not show_progress):
+
+            if step == 0:
+                
+                # compute initial fwd pass to get current_scores and current_grads (same as OG)
+                onehot = th.nn.functional.one_hot(current_samples, num_classes=d_vocab).float()
+                onehot.requires_grad_(True)
+                x = onehot @ model.embed.W_E
+                x = x + model.pos_embed(current_samples)
+                for block in model.blocks:
+                    x = block(x)
+                x = model.ln_final(x[:,-1].unsqueeze(1))
+                y = model.unembed(x).squeeze(1)
+                current_scores = y[:, target]
+                current_scores.sum().backward()
+                current_scores = current_scores.detach().clone()
+                current_grads = onehot.grad.detach().clone()
+                current_results = (y.argmax(dim=-1) == target).float()
+                # after we have current_grads, we can initialize velocity to this to give it some initial direction
+                vel = current_grads.detach().clone()
+                # then, clear onehot grad
+                onehot.grad = None
+
+            # for steps 2-n: 
+            pos = th.randint(0, ctx_len, (batch_size,), device=current_samples.device)
+            
+            # at each proposal step, we compute two candidate velocities, which take into account the previous step
+            # one velocity for forward proposal probability, and one for reverse proposal probability  
+            batch_idx = th.arange(batch_size, device=current_samples.device)
+            vel_prev_at_pos = vel[batch_idx, pos] # shape (batch_size, d_vocab)
+            current_grads_at_pos = vel[batch_idx, pos]
+            vel_from_current = lam * vel_prev_at_pos + (1.0 - lam) * current_grads_at_pos
+
+            # Compute proposal probabilities, which use vel_from_current 
+            proposal_logits = orig_log_probs[pos] + vel_from_current / temp
+            proposal_probs = th.softmax(proposal_logits, dim=-1)
+            
+            # Propose new tokens
+            proposed_tokens = th.multinomial(proposal_probs, 1).squeeze(-1)
+
+            # Create proposed samples
+            proposed_samples = current_samples.clone()
+            proposed_samples[batch_idx, pos] = proposed_tokens
+
+            # Recompute scores and gradients for proposed samples
+            onehot = th.nn.functional.one_hot(proposed_samples, num_classes=d_vocab).float()
+            onehot.requires_grad_(True)
+            x = onehot @ model.embed.W_E
+            x = x + model.pos_embed(proposed_samples)
+            for block in model.blocks:
+                x = block(x)
+            x = model.ln_final(x[:,-1].unsqueeze(1))
+            y = model.unembed(x).squeeze(1)
+            proposed_scores = y[:, target]
+            proposed_scores.sum().backward()
+            proposed_grads = onehot.grad.clone()
+            proposed_results = (y.argmax(dim=-1) == target).float()
+
+            # Clear gradients
+            onehot.grad = None
+
+            # now, for the reverse proposal probabilities, we need to create a new momentum / velocity term
+            proposed_grads_at_pos = proposed_grads[batch_idx, pos]
+            vel_from_proposed = lam * vel_prev_at_pos + (1.0 - lam) * proposed_grads_at_pos
+            
+            # Compute reverse proposal probabilities, which use the new velocity term
+            reverse_proposal_logits = orig_log_probs[pos] + vel_from_proposed / temp
+            reverse_proposal_probs = th.softmax(reverse_proposal_logits, dim=-1)
+
+            # Compute log acceptance probabilities
+            current_tokens_at_pos = current_samples[batch_idx, pos] # this just makes for easier indexing
+            log_accept_probs = (proposed_scores - current_scores) / temp + \
+                               orig_log_probs[pos, proposed_tokens] - orig_log_probs[pos, current_tokens_at_pos] + \
+                               th.log(reverse_proposal_probs[batch_idx, current_tokens_at_pos]) - \
+                               th.log(proposal_probs[batch_idx, proposed_tokens])
+
+            # Accept or reject proposals
+            accept_mask = th.log(th.rand(batch_size, device=log_accept_probs.device)) < log_accept_probs
+            # update the samples and scores where accepted
+            current_samples[accept_mask] = proposed_samples[accept_mask]
+            current_scores[accept_mask] = proposed_scores[accept_mask]
+            current_grads[accept_mask] = proposed_grads[accept_mask]
+            current_results[accept_mask] = proposed_results[accept_mask]
+
+            # then, we "commit" velocity per-chain: accepted chains get vel_from_proposed, rejected chains get vel_from_current
+            # vel_from_current and vel_from_proposed have shape (batch_size, d_vocab), but they need to be shape vel[:, pos, :]
+            # here, the default committed velocity is vel_from_current (if proposal was rejected)
+            # if proposal was accepted, we use the accept_mask to set the velocity at those accepted tokens as the vel_from proposed
+            # this then becomes the new starting point for the next move 
+            commit_vel_at_pos = vel_from_current.clone()
+            commit_vel_at_pos[accept_mask] = vel_from_proposed[accept_mask]
+            vel[batch_idx, pos] = commit_vel_at_pos
+
+            current_scores = current_scores.detach().clone()
+            current_grads = current_grads.detach().clone()
+            current_results = current_results.detach().clone()
+            current_samples = current_samples.detach().clone()
+
+            if step >= burn_in:
+                results.append(current_results.detach().clone())
+                scores.append(current_scores.detach().clone())
+
+            acceptance_rate += accept_mask.float().mean().item()
+            total_proposals += 1
+
+    acceptance_rate /= total_proposals
+
+    results = th.cat(results)
+    scores = th.cat(scores)
+    exp_scores = th.exp(scores / temp)
+    normalizing_constant = 1 / (1 / exp_scores).mean().item()  # E_p[exp(s(x)/temp)]
+    unbiased_estimates = results * normalizing_constant / exp_scores
+
+    return unbiased_estimates.mean().item()
